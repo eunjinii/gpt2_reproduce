@@ -168,7 +168,7 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
     
-    def configure_optimizers(self, weight_decay, learning_rate, device):
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
         # start with all of the candidate parameters (that require grad)
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
@@ -305,7 +305,7 @@ else:
         device = "mps"
     print(f"using device: {device}")
     
-device = "cuda" if device.startswith("cuda") else "cpu"
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -355,7 +355,7 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # optimization steps
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
@@ -377,7 +377,7 @@ for step in range(max_steps):
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(x, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
@@ -415,7 +415,7 @@ for step in range(max_steps):
             mask = mask.to(device)
             # get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
@@ -447,7 +447,7 @@ for step in range(max_steps):
         sample_rng.manual_seed(42 + ddp_rank)
         while xgen.size(1) < max_length:
             with torch.no_grad():
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(xgen) # (B, T, vocab_size)
                 logits = logits[:, -1, :] # (B, vocab_size) only use the last logit to predict the next token
                 
@@ -471,7 +471,7 @@ for step in range(max_steps):
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16): ## 2
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16): ## 2
             logits, loss = model(x, y)
         loss = loss / grad_accum_steps ## 9. normalizing by grad_accum_steps
         loss_accum += loss.detach()
