@@ -268,10 +268,8 @@ def get_most_likely_row(tokens, mask, logits):
     return pred_norm
 # -----------------------------------------------------------------------------
 
-# simple launch:
-# python train_gpt2.py
-# DDP launch for e.g. 8 GPUs:
-# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+# simple launch: $ python train_gpt2.py
+# DDP launch for e.g. 8 GPUs: $ torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
 # run the training loop
 from torch.distributed import init_process_group, destroy_process_group
@@ -340,7 +338,7 @@ raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 19703 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_steps = 19703 * 4 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
