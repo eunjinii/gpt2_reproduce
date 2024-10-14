@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
 
+torch.cuda.empty_cache()  # Clear the cache
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -119,7 +121,6 @@ class GPT(nn.Module):
         logits = self.lm_head(x) # (B, T, vocab_size)
         loss = None
         if targets is not None:
-            # flattening out 3-dim into 2-dim, (-1(B*T), vocab_size)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         
         return logits, loss
@@ -241,8 +242,7 @@ class DataLoaderLite:
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * self.num_processes
-        
+            self.current_position = B * T * self.process_rank
         return x, y
 
 # -----------------------------------------------------------------------------
@@ -312,7 +312,7 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288 # roughly 2**19, ~0.5M, in number of tokens
-B = 64
+B = 32
 T = 1024 # B*T = 16,384 tokens in one forward & backward
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B*T*ddp_world_size" # each gpu calculates loss of B*T*ddp_world_size tokens in one step
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # single update in 32 grad accums
@@ -320,8 +320,8 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=16, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-val_loader = DataLoaderLite(B=16, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 torch.set_float32_matmul_precision('high') ## 1 tells pytorch what kernels to run
 
@@ -338,7 +338,7 @@ raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 19703 * 4 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_steps = 19703 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
