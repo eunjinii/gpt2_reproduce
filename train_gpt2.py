@@ -8,6 +8,7 @@ import torch.nn as nn
 from dataclasses import dataclass
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
+from collections import OrderedDict
 
 torch.cuda.empty_cache()  # Clear the cache
 
@@ -22,7 +23,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-    def forward(self, x, output_attentions=False):
+    def forward(self, x, kv_cache=None, use_cache=False, output_attentions=False):
         B, T, C = x.size() # batch, seq_len, embedding dim
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
@@ -30,22 +31,29 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        if output_attentions:
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, 0)
-            att = F.softmax(att, dim=-1)
-            y = att @ v
-        else:
-            y, att_weights = F.scaled_dot_product_attention(q, k, v, is_causal=True) ## 4 flashattention
+        # Initialize kv_cache if not provided (first step)
+        if use_cache and kv_cache is not None:
+            k = torch.cat([kv_cache["k"], k], dim=-2) # Append new keys
+            v = torch.cat([kv_cache["v"], v], dim=-2) # Append new values
+
+        # Update kv_cache if caching is enabled
+        updated_kv_cache = {"k": k, "v": v} if use_cache else None
         
+        # Compute attention weights
+        att_weights = None
+        if output_attentions:
+            att_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(k.size(-1))
+            att_weights = F.softmax(att_weights, dim=-1)
+            y = torch.matmul(att_weights, v)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True) ## 4 flashattention
+
         # Reshape back to original size
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
-        
-        if output_attentions:
-            return y, att  # Return both output and attention weights
-        else:
-            return y  # Only return the output
+
+        # Return outputs and attention weights if needed
+        return y, att_weights, updated_kv_cache
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -69,16 +77,14 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
     
-    def forward(self, x, output_attentions=False):
-        attn_output = self.attn(self.ln_1(x), output_attentions=output_attentions)
-        if output_attentions:
-            attn_output, attn_weights = attn_output  # Unpack if attention weights are returned
-        else:
-            attn_weights = None  # No attention weights returned
-            
+    def forward(self, x, kv_cache=None, use_cache=False, output_attentions=False):
+        attn_output, attn_weights, updated_kv_cache = self.attn(
+            self.ln_1(x), kv_cache=kv_cache, use_cache=use_cache, output_attentions=output_attentions
+        )
         x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
-        return x, attn_weights
+
+        return x, attn_weights, updated_kv_cache
 
 @dataclass
 class GPTConfig:
@@ -100,7 +106,6 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        
         self.transformer.wte.weight = self.lm_head.weight
         
         # init params
@@ -117,8 +122,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, **kwargs):
-        output_attentions = kwargs.get('output_attentions', False)
+    def forward(self, idx, targets=None, kv_cache=None, use_cache=False, output_attentions=False):
         # idx is of shape (B, T), T is time dimension
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -130,8 +134,8 @@ class GPT(nn.Module):
 
         all_attentions = []  # Store attention weights from all layers
         for block in self.transformer.h:
-            x, attn_weights = block(x, output_attentions=output_attentions)  # Get output and attention weights
-            if output_attentions:
+            x, attn_weights, kv_cache = block(x, kv_cache=kv_cache, use_cache=use_cache, output_attentions=output_attentions)
+            if output_attentions and output['attn_weights'] is not None:
                 all_attentions.append(attn_weights)
                 
         x = self.transformer.ln_f(x)
@@ -139,8 +143,15 @@ class GPT(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        
-        return logits, loss, all_attentions
+
+        output = OrderedDict()
+        output['logits'] = logits
+        output['loss'] = loss
+        output['kv_cache'] = kv_cache  # Include the kv_cache in the output
+        if output_attentions:
+            output['attentions'] = all_attentions
+
+        return output
     
     @classmethod
     def from_pretrained(cls, model_type):
@@ -393,9 +404,10 @@ if __name__ == "__main__":
                 for _ in range(val_loss_steps):
                     x, y = val_loader.next_batch()
                     x, y = x.to(device), y.to(device)
+
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss, _ = model(x, y)
-                    loss = loss / val_loss_steps
+                        output = model(x, y)
+                    loss = output['loss'] / val_loss_steps
                     val_loss_accum += loss.detach()
             
             if ddp:
@@ -432,8 +444,8 @@ if __name__ == "__main__":
                 # get the logits
                 with torch.no_grad():
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss, _ = model(tokens)
-                    pred_norm = get_most_likely_row(tokens, mask, logits)
+                        output = model(tokens)
+                    pred_norm = get_most_likely_row(tokens, mask, output['logits'])
                 num_total += 1
                 num_correct_norm += int(pred_norm == label)
             # reduce the stats across all processes
@@ -464,8 +476,8 @@ if __name__ == "__main__":
             while xgen.size(1) < max_length:
                 with torch.no_grad():
                     with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss, _ = model(xgen) # (B, T, vocab_size)
-                    logits = logits[:, -1, :] # (B, vocab_size) only use the last logit to predict the next token
+                        output = model(xgen) # (B, T, vocab_size)
+                    logits = output['logits'][:, -1, :] # (B, vocab_size) only use the last logit to predict the next token
                     
                     probs = F.softmax(logits, dim=-1)
                     topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
@@ -488,8 +500,8 @@ if __name__ == "__main__":
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16): ## 2
-                logits, loss, _ = model(x, y)
-            loss = loss / grad_accum_steps ## 9. normalizing by grad_accum_steps
+                output = model(x, y)
+            loss = output['loss'] / grad_accum_steps ## 9. normalizing by grad_accum_steps
             loss_accum += loss.detach()
             if ddp:
                 # only turned on in the last step
