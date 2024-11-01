@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
 from collections import OrderedDict
+from dilated_attention import MixedDilatedAttention
 
 torch.cuda.empty_cache()  # Clear the cache
 
@@ -73,7 +74,8 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
+        # self.attn = CausalSelfAttention(config)
+        self.attn = MixedDilatedAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
     
@@ -93,6 +95,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768 # embedding dim
+    alpha: int = 4
 
 class GPT(nn.Module):
     def __init__(self, config):
