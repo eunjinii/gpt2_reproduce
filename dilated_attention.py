@@ -1,157 +1,93 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import time
 import math
 
-def make_window_dilation_pairs(self, sequence_length):
-    i = 1
-    pairs = []
-    while i*4 <= sequence_length:
-        pairs.append((i*4, i)) # window_size, dilation_rate
-        i *= self.alpha
-    return pairs 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.cuda.empty_cache()  # Clear the cache
 
-def create_dilated_mask(row_dim, col_dim, dilation_rate, head_index=0, offset=True):
-    mask = torch.zeros(row_dim, col_dim)
-    start = (head_index % dilation_rate) if offset else 0
-    for i in range(start, row_dim, dilation_rate):
-        for j in range(start, col_dim, dilation_rate):
-            # if i >= j:
-            mask[i, j] = 1
-    return mask
-
-def sparseToDense(sparse_tensor, dilation_rate, head_index=0, offset=True):
-    leading_dims = sparse_tensor.shape[:-2]
-    s_r, s_c = sparse_tensor.shape[-2], sparse_tensor.shape[-1]
-    d_r, d_c = s_r // dilation_rate, s_c // dilation_rate
-    dense_tensor = torch.zeros(*leading_dims, d_r, d_c, device=sparse_tensor.device)
-    
-    start = (head_index % dilation_rate) if offset else 0
-    for i in range(d_r):
-        for j in range(d_c):
-            dense_tensor[..., i, j] = sparse_tensor[..., start + i * dilation_rate, start + j * dilation_rate]
-    return dense_tensor
-
-def denseToSparse(dense_tensor, dilation_rate, head_index=0, offset=True):
-    leading_dims = dense_tensor.shape[:-2]
-    d_r, d_c = dense_tensor.shape[-2], dense_tensor.shape[-1]
-    s_r, s_c = d_r * dilation_rate, d_c * dilation_rate
-    sparse_tensor = torch.zeros(*leading_dims, s_r, s_c, device=dense_tensor.device)
-    
-    start = (head_index % dilation_rate) if offset else 0
-    for i in range(d_r):
-        for j in range(d_c):
-            sparse_tensor[..., start + i * dilation_rate, start + j * dilation_rate] = dense_tensor[..., i, j]
-    return sparse_tensor
-
-class MixedDilatedAttention(nn.Module):
-    def __init__(self, config):
+class DilatedAttention2(nn.Module):
+    def __init__(self, config, segment_size, dilation_rate):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.alpha = config.alpha
-
-    # attention within a window
-    def dilated_attention_window(self, partial_q, partial_k, partial_v, window_size, dilation_rate, dropout_p=0.0, is_causal=False):
-        head_index, window_size, hidden_dim = partial_q.size(-3), partial_q.size(-2), partial_k.size(-1)
-        scale_factor = 1 / math.sqrt(hidden_dim)
-        attn_bias = torch.zeros(window_size, window_size, dtype=partial_q.dtype)
-    
-        # generate and apply masks to q, k, and v
-        mask = create_dilated_mask(window_size, hidden_dim, dilation_rate, head_index, offset=True)
-        masked_q = partial_q * mask
-        masked_k = partial_k * mask
-        masked_v = partial_v * mask
+        self.head_dim = config.n_embd // config.n_head
+        self.block_size = config.block_size
         
-        # Apply causal mask if is_causal is True
-        if is_causal:
-            causal_mask = torch.tril(torch.ones(window_size, window_size, dtype=torch.bool))
-            attn_bias.masked_fill_(~causal_mask, float("-inf") )
+        self.segment_size = segment_size
+        self.dilation_rate = dilation_rate
         
-        attn_weight = torch.matmul(masked_q, masked_k.transpose(-2, -1)) * scale_factor + attn_bias
-        attn_weight = sparseToDense(attn_weight, dilation_rate, head_index)
+        # Linear Projections
+        self.proj_q = nn.Linear(config.n_embd, config.n_embd, bias=False).to(device)
+        self.proj_k = nn.Linear(config.n_embd, config.n_embd, bias=False).to(device)
+        self.proj_v = nn.Linear(config.n_embd, config.n_embd, bias=False).to(device)
+        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=False).to(device)
         
-        print(attn_weight)
-        attn_weight = torch.softmax(attn_weight, dim=-1)
-        attn_weight = denseToSparse(attn_weight, dilation_rate, head_index)
-        print(attn_weight)
-        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+        self.norm = nn.LayerNorm(config.n_embd).to(device)
         
-        output_hat = attn_weight @ masked_v
-        output_hat = output_hat * mask # output masking rule
-        num_row = int(attn_weight.sum(dim=-1).sum().item()) # row that has some values other than zeros
-        return output_hat, attn_weight, num_row
-
-    def forward(self, x):
-        B, T, C = x.size() # batch, seq_len, embedding dim (from nanogpt)
-        head_dim = C // self.n_head
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=-1)
-
-        k = k.view(B, T, self.n_head, head_dim).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, head_dim).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, head_dim).transpose(1, 2) # (B, nh, T, hs)
-
-        y = torch.zeros(B, T, C, device=x.device)
-        denominator = []
-        wr_pairs = self.make_window_dilation_pairs(sequence_length=T)
-
-        for window_size, dilation_rate in wr_pairs: # multiple segment - dilation pairs
-            partial_denominator = 0
-            num_windows = T // window_size
-            # concated_output = torch.zeros(B, self.n_head, T, head_dim, device=x.device)
-            concated_output = torch.zeros(B, T, C, device=x.device)
-
-            for i in range(num_windows): # parallel segment
-                start = i * window_size
-                end = start + window_size
-                
-                # Slice out the window for q, k, v
-                partial_q = q[:, :, start:end, :]  # (B, nh, window_size, hs)
-                partial_k = k[:, :, start:end, :]  # (B, nh, window_size, hs)
-                partial_v = v[:, :, start:end, :]  # (B, nh, window_size, hs)
-                
-                window_output, attn_weight, num_row = self.dilated_attention_window(
-                    partial_q, partial_k, partial_v, window_size, dilation_rate, is_causal=True
-                )
-
-                # Reshape window_output to (B, window_size, C) for placement in concated_output
-                window_output = window_output.transpose(1, 2).reshape(B, window_size, C)
-                concated_output[:, start:end, :] = window_output
-                partial_denominator += num_row
-            
-            denominator.append(partial_denominator)
-            y += concated_output * partial_denominator
-  
-        y /= sum(denominator)
+    def forward(self, x, kv_cache=None, use_cache=False, output_attentions=False):
+        B, N, D = x.size()
+        device = x.device
         
-        att_weights, updated_kv_cache = None, None 
+        assert N % self.segment_size == 0, f"N: {N}, segment_size: {self.segment_size}"
+        assert self.segment_size % self.dilation_rate == 0
         
+        # Sparsify
+        x = x.view(B, N // self.segment_size, self.segment_size, D)
+        x = x[:, :, :: self.dilation_rate, :]
+        q, k, v = map(self.norm, (self.proj_q(x), self.proj_k(x), self.proj_v(x))) # q,k,v: torch.Size([B, num_segments, segment_size // dilation_rate, D])
+        
+        # TODO: Implement cache
+        # TODO: Implement shifting positions
+        
+        # All gather
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # torch.Size([B, num_segments, segment_size // dilation_rate, D])
+        y = y.reshape(B, -1, D) # torch.Size([B, N // dilation_rate, D])
+        y_full = torch.zeros(B, N, D, device=y.device, dtype=y.dtype)
+        y_full[:, ::self.dilation_rate, :] = y
+        y_full = self.out_proj(y_full)
+        
+        att_weights, updated_kv_cache = None, None
+        
+        return y_full, att_weights, updated_kv_cache
+
+class MixedDilatedAttention(nn.Module):
+    def __init__(self, config, wr_pairs):
+        super().__init__()
+        self.config = config
+        self.wr_pairs = wr_pairs
+        self.dilated_attn = nn.ModuleList()
+        for segment_size, dilation_rate in self.wr_pairs:
+            self.dilated_attn = nn.ModuleList(
+                [DilatedAttention2(self.config, segment_size, dilation_rate) for segment_size, dilation_rate in self.wr_pairs]
+            )
+
+        from causal_self_attention import CausalSelfAttention
+        self.self_attn = CausalSelfAttention(config)
+
+    def forward(self, x, kv_cache=None, use_cache=False, output_attentions=False):
+        N = x.size(1)
+        y = None
+        
+        is_dilated = False
+        for segment_size, _ in self.wr_pairs:
+            if N % segment_size == 0:
+                is_dilated = True
+            else:
+                is_dilated = False
+                break
+        
+        if is_dilated:
+            for block in self.dilated_attn:
+                output, _, _ = block(x)
+                y = output if y is None else y + output
+        else:
+            output, _, _ = self.self_attn(x)
+            y = output
+        
+        att_weights, updated_kv_cache = None, None
         return y, att_weights, updated_kv_cache
-
-# class Block(nn.Module):
-#     def __init__(self, config):
-#         super().__init__()
-#         self.attn = MixedDilatedAttention(config)
-    
-#     def forward(self, x):
-#         attn_output, attn_weights, updated_kv_cache = self.attn(x)
-#         x = x + attn_output
-#         return x, attn_weights, updated_kv_cache
-    
-# class Config:
-#     # block_size: int = 16 # max seq_len
-#     n_embd = 4
-#     n_head = 1
-#     alpha = 2
-
-# config = Config()
-# sequence_length = 32
-# hidden_dim = config.n_embd
-
-# x = torch.randn(1, sequence_length, hidden_dim)  # Batch size of 1
-# attention_layer = MixedDilatedAttention(config)
-# output = attention_layer(x)
-# print(output)
