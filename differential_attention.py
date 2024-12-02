@@ -65,56 +65,5 @@ class DifferentialFlashAttention(nn.Module):
         y = self.out_proj(y) # torch.Size([B, N, D])
         
         att_weights, updated_kv_cache = None, None
-        
+
         return y, att_weights, updated_kv_cache
-
-class DifferentialFlashAttention2(nn.Module):
-    def __init__(self, config, depth):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.head_dim = config.n_embd // config.n_head // 2 # head_dim splitted by two for dual-query mechanism
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
-        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-
-        self.lambda_init = lambda_init_fn(depth)
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        
-        self.rms_norm = nn.RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
-
-    def forward(self, x, kv_cache=None, use_cache=False, output_attentions=False):
-        B, N, D = x.size()  # batch size, sequence length, embedding dimension
-        qkv = self.c_attn(x)  # combined query, key, value projection
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        
-        q = q.view(B, N, self.n_head, self.head_dim) # torch.Size([B, N, H, d])
-        k = k.view(B, N, self.n_head, self.head_dim) # torch.Size([B, N, H, d])
-        v = v.view(B, N, self.n_head, self.head_dim) # torch.Size([B, N, H, d])
-        
-        # Split the last dimension into two components for dual-query mechanism
-        q = q.reshape(B, N, self.n_head, 2, self.head_dim)
-        k = k.reshape(B, N, self.n_head, 2, self.head_dim)
-        q1, q2 = q[:, :, :, 0], q[:, :, :, 1] # torch.Size([B, N, H, 2, d])
-        k1, k2 = k[:, :, :, 0], k[:, :, :, 1] # torch.Size([B, N, H, 2, d])
-        
-        att_weights1 = F.scaled_dot_product_attention(q1, k1, v) # torch.Size([B, N, H, 2d])
-        att_weights2 = F.scaled_dot_product_attention(q2, k2, v) # torch.Size([B, N, H, 2d])
-
-        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
-        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
-        lambda_full = lambda_1 - lambda_2 + self.lambda_init
-        y = att_weights1 - lambda_full * att_weights2
-        
-        y = self.rms_norm(y)
-        y = y * (1 - self.lambda_init)
-        y = y.reshape(B, N, D)
-        y = self.out_proj(y) # torch.Size([B, N, D])
-        
-        att_weights, updated_kv_cache = None, None
-        
-        return y, att_weights, updated_kv_cache
-    
