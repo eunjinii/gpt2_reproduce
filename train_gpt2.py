@@ -5,56 +5,16 @@ import inspect
 import numpy as np
 import torch
 import torch.nn as nn
+from datetime import datetime
 from dataclasses import dataclass
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
 from collections import OrderedDict
+from causal_self_attention import CausalSelfAttention
 from dilated_attention import MixedDilatedAttention
+from differential_attention import DifferentialFlashAttention
 
 torch.cuda.empty_cache()  # Clear the cache
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-        
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-
-    def forward(self, x, kv_cache=None, use_cache=False, output_attentions=False):
-        B, T, C = x.size() # batch, seq_len, embedding dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # Initialize kv_cache if not provided (first step)
-        if use_cache and kv_cache is not None:
-            k = torch.cat([kv_cache["k"], k], dim=-2) # Append new keys
-            v = torch.cat([kv_cache["v"], v], dim=-2) # Append new values
-
-        # Update kv_cache if caching is enabled
-        updated_kv_cache = {"k": k, "v": v} if use_cache else None
-        
-        # Compute attention weights
-        att_weights = None
-        if output_attentions:
-            att_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(k.size(-1))
-            att_weights = F.softmax(att_weights, dim=-1)
-            y = torch.matmul(att_weights, v)
-        else:
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True) ## 4 flashattention
-
-        # Reshape back to original size
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
-
-        # Return outputs and attention weights if needed
-        return y, att_weights, updated_kv_cache
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -71,11 +31,15 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, depth):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
         # self.attn = CausalSelfAttention(config)
-        self.attn = MixedDilatedAttention(config)
+        self.attn = MixedDilatedAttention(
+            config, 
+            wr_pairs = [(64, 1),(128, 2),(256,4),(512,8),(1024,16)]
+        )
+        # self.attn = DifferentialFlashAttention(config, depth)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
     
@@ -95,7 +59,6 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768 # embedding dim
-    alpha: int = 4
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -105,7 +68,9 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([
+                Block(config, depth) for depth in range(config.n_layer)
+            ]),
             ln_f = nn.LayerNorm(config.n_embd)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -344,7 +309,7 @@ if __name__ == "__main__":
     enc = tiktoken.get_encoding("gpt2")
 
     total_batch_size = 524288 # roughly 2**19, ~0.5M, in number of tokens
-    B = 32
+    B = 32 # original B = 32
     T = 1024 # B*T = 16,384 tokens in one forward & backward
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B*T*ddp_world_size" # each gpu calculates loss of B*T*ddp_world_size tokens in one step
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # single update in 32 grad accums
@@ -364,12 +329,14 @@ if __name__ == "__main__":
     if use_compile:
         model = torch.compile(model)    
     if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank])
+        # find_unused_parameters=True for the MixedDilatedAttention to work
+        model = DDP(model, find_unused_parameters=True, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
 
     max_lr = 6e-4
     min_lr = max_lr * 0.1
     warmup_steps = 715
+    # warmup_steps = 375 #FIXME: 375 for differential attention
     max_steps = 19703 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
     def get_lr(it):
         # 1) linear warmup for warmup_iters steps
@@ -386,9 +353,11 @@ if __name__ == "__main__":
 
     # optimization steps
     optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+    # optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=1.5e-4, device_type=device_type) #FIXME: 1.5e-4 for differential attention
 
     # create the log directory we will write checkpoints to and log to
-    log_dir = "log"
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H")
+    log_dir = f"log_{timestamp}"
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"log.txt")
     with open(log_file, "w") as f: # open for writing to clear the file
