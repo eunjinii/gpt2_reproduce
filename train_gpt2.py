@@ -10,13 +10,15 @@ from dataclasses import dataclass
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
 from collections import OrderedDict
-from causal_self_attention import CausalSelfAttention
-from dilated_attention import MixedDilatedAttention
-from differential_attention import DifferentialFlashAttention
+from attention.causal_self_attention import CausalSelfAttention
+from attention.dilated_attention import MixedDilatedAttention
+from attention.differential_attention import DifferentialFlashAttention
+from attention.linear_attention import LinearAttention
+from attention.feedforward import MLPFFN, MixFFN
 
 torch.cuda.empty_cache()  # Clear the cache
 
-class MLP(nn.Module):
+class MLPFFN(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc   = nn.Linear(config.n_embd, 4 * config.n_embd)
@@ -35,13 +37,15 @@ class Block(nn.Module):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
         # self.attn = CausalSelfAttention(config)
-        self.attn = MixedDilatedAttention(
-            config, 
-            wr_pairs = [(64, 1),(128, 2),(256,4),(512,8),(1024,16)]
-        )
+        # self.attn = MixedDilatedAttention(
+        #     config, 
+        #     wr_pairs = [(64, 1),(128, 2),(256,4),(512,8),(1024,16)]
+        # )
         # self.attn = DifferentialFlashAttention(config, depth)
+        self.attn = LinearAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = MLP(config)
+        # self.mlp = MLPFFN(config)
+        self.mlp = MixFFN(config)
     
     def forward(self, x, kv_cache=None, use_cache=False, output_attentions=False):
         attn_output, attn_weights, updated_kv_cache = self.attn(
@@ -54,7 +58,7 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024 # max seq_len
+    block_size: int = 2048 # max seq_len
     vocab_size: int = 50257 # num of tokens
     n_layer: int = 12
     n_head: int = 12
@@ -75,7 +79,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
-        
+
         # init params
         self.apply(self._init_weights) # iterate all submodule and apply init_modules
     
@@ -135,7 +139,7 @@ class GPT(nn.Module):
             'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600),
         }[model_type]
         config_args['vocab_size'] = 50257
-        config_args['block_size'] = 1024
+        config_args['block_size'] = 2048
         
         # create my from-scratch GPT model
         config = GPTConfig(**config_args)
@@ -309,8 +313,8 @@ if __name__ == "__main__":
     enc = tiktoken.get_encoding("gpt2")
 
     total_batch_size = 524288 # roughly 2**19, ~0.5M, in number of tokens
-    B = 32 # original B = 32
-    T = 1024 # B*T = 16,384 tokens in one forward & backward
+    B = 16 # original B = 32
+    T = 2048 # B*T = 16,384 tokens in one forward & backward
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B*T*ddp_world_size" # each gpu calculates loss of B*T*ddp_world_size tokens in one step
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # single update in 32 grad accums
     if master_process:
@@ -333,9 +337,11 @@ if __name__ == "__main__":
         model = DDP(model, find_unused_parameters=True, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
 
-    max_lr = 6e-4
+    max_lr = 3e-4 # batch size 16
+    # max_lr = 6e-4 # original
     min_lr = max_lr * 0.1
-    warmup_steps = 715
+    warmup_steps = 1500
+    # warmup_steps = 715 # Original
     # warmup_steps = 375 #FIXME: 375 for differential attention
     max_steps = 19703 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
     def get_lr(it):
@@ -352,12 +358,13 @@ if __name__ == "__main__":
         return min_lr + coeff * (max_lr - min_lr)
 
     # optimization steps
-    optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+    optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device_type) # batch size 8
+    # optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type) # original
     # optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=1.5e-4, device_type=device_type) #FIXME: 1.5e-4 for differential attention
 
     # create the log directory we will write checkpoints to and log to
     timestamp = datetime.now().strftime("%Y-%m-%d_%H")
-    log_dir = f"log_{timestamp}"
+    log_dir = f"log/log_{timestamp}_B{B}_T{T}_lr{max_lr}"
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"log.txt")
     with open(log_file, "w") as f: # open for writing to clear the file

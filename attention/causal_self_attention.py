@@ -1,17 +1,9 @@
 import os
 import math
 import time
-import inspect
-import numpy as np
 import torch
 import torch.nn as nn
-from datetime import datetime
-from dataclasses import dataclass
 from torch.nn import functional as F
-from hellaswag import render_example, iterate_examples
-from collections import OrderedDict
-from dilated_attention import MixedDilatedAttention
-from differential_attention import DifferentialFlashAttention
 
 torch.cuda.empty_cache()  # Clear the cache
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

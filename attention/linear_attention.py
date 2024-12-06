@@ -3,42 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 import math
+from attention.norms import RMSNorm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.cuda.empty_cache()  # Clear the cache
-
-class MixFFN(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.n_embd = config.n_embd
-        # self.hidden_dim = 2 * config.n_embd
-        # self.inverted_conv = nn.Conv1d(config.n_embd, self.hidden_dim * 2, kernel_size=1)
-        self.depthwise_conv = nn.Conv1d(
-            config.n_embd,
-            config.n_embd,
-            kernel_size=3,
-            padding=1,
-            groups=config.n_embd,
-        )
-        self.act = nn.Sigmoid()
-        self.pointwise_conv = nn.Conv1d(config.n_embd //2, config.n_embd, kernel_size=1)
-        self.norm = nn.BatchNorm1d(config.n_embd)  # Normalize after pointwise_conv
-
-
-    def forward(self, x):
-        x = x.transpose(1, 2)
-        x = self.depthwise_conv(x)
-        x = self.norm(x)
-
-        # Gating 
-        x, gate = torch.chunk(x, 2, dim=1)  # Split into (x, gate)
-        gate = self.act(gate)
-        x = x * gate
-        
-        x = self.pointwise_conv(x) 
-        x = self.norm(x)
-        x = x.transpose(1, 2)
-        return x
 
 class LinearAttention(nn.Module):
     def __init__(self, config):
