@@ -5,6 +5,7 @@ import inspect
 import numpy as np
 import torch
 import torch.nn as nn
+import wandb
 from datetime import datetime
 from dataclasses import dataclass
 from torch.nn import functional as F
@@ -18,34 +19,33 @@ from attention.feedforward import MLPFFN, MixFFN
 
 torch.cuda.empty_cache()  # Clear the cache
 
-class MLPFFN(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc   = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu   = nn.GELU(approximate='tanh')
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
+BLOCK_SIZE = 2048 # B*T = 16,384 tokens in one forward & backward
+N_LAYER = 12
+N_HEAD = 12
+N_EMBD = 768
 
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        return x
+BATCH_SIZE = 16 # # original B = 32
+TOTAL_BATCH_SIZE = 524288
+LEARNING_RATE = 3e-4        # Originally 6e-4, 3e-4 is adjusted for batch size 16
+MAX_STEPS = 19703           # ??
+WARMUP_STEPS = 1500         # Originally 715, 1500 is adjusted for batch size 16
+MODEL_NAME = 'gpt2'
+DATASET_NAME = 'edu_fineweb10B'
 
 class Block(nn.Module):
     def __init__(self, config, depth):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        # self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config)
         # self.attn = MixedDilatedAttention(
         #     config, 
         #     wr_pairs = [(64, 1),(128, 2),(256,4),(512,8),(1024,16)]
         # )
         # self.attn = DifferentialFlashAttention(config, depth)
-        self.attn = LinearAttention(config)
+        # self.attn = LinearAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        # self.mlp = MLPFFN(config)
-        self.mlp = MixFFN(config)
+        self.mlp = MLPFFN(config)
+        # self.mlp = MixFFN(config)
     
     def forward(self, x, kv_cache=None, use_cache=False, output_attentions=False):
         attn_output, attn_weights, updated_kv_cache = self.attn(
@@ -58,11 +58,11 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 2048 # max seq_len
+    block_size: int = BLOCK_SIZE # max seq_len
     vocab_size: int = 50257 # num of tokens
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768 # embedding dim
+    n_layer: int = N_LAYER
+    n_head: int = N_HEAD
+    n_embd: int = N_EMBD # embedding dim
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -139,7 +139,7 @@ class GPT(nn.Module):
             'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600),
         }[model_type]
         config_args['vocab_size'] = 50257
-        config_args['block_size'] = 2048
+        config_args['block_size'] = BLOCK_SIZE
         
         # create my from-scratch GPT model
         config = GPTConfig(**config_args)
@@ -276,6 +276,18 @@ if __name__ == "__main__":
     from torch.distributed import init_process_group, destroy_process_group
     from torch.nn.parallel import DistributedDataParallel as DDP
     import torch.distributed as dist
+    
+    # Initialize wandb
+    wandb.init(project="gpt2-training", entity="eunjin-lee", config={
+        "model": MODEL_NAME,
+        "batch_size": BATCH_SIZE,
+        "total_batch_size": TOTAL_BATCH_SIZE,
+        "block_size": BLOCK_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "max_steps": MAX_STEPS, # 19703
+        "warmup_steps": WARMUP_STEPS, # 1500
+    })
+    wandb.run.name = f'{MODEL_NAME}_{DATASET_NAME}_B{BATCH_SIZE}_T{BLOCK_SIZE}_lr{LEARNING_RATE}'
 
     # set up DDP (distributed data parallel).
     # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
@@ -312,9 +324,9 @@ if __name__ == "__main__":
 
     enc = tiktoken.get_encoding("gpt2")
 
-    total_batch_size = 524288 # roughly 2**19, ~0.5M, in number of tokens
-    B = 16 # original B = 32
-    T = 2048 # B*T = 16,384 tokens in one forward & backward
+    total_batch_size = TOTAL_BATCH_SIZE # roughly 2**19, ~0.5M, in number of tokens
+    B = BATCH_SIZE # original B = 32
+    T = BLOCK_SIZE # B*T = 16,384 tokens in one forward & backward
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B*T*ddp_world_size" # each gpu calculates loss of B*T*ddp_world_size tokens in one step
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # single update in 32 grad accums
     if master_process:
@@ -337,13 +349,13 @@ if __name__ == "__main__":
         model = DDP(model, find_unused_parameters=True, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
 
-    max_lr = 3e-4 # batch size 16
+    max_lr = LEARNING_RATE # batch size 16
     # max_lr = 6e-4 # original
     min_lr = max_lr * 0.1
-    warmup_steps = 1500
+    warmup_steps = WARMUP_STEPS
     # warmup_steps = 715 # Original
     # warmup_steps = 375 #FIXME: 375 for differential attention
-    max_steps = 19703 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+    max_steps = MAX_STEPS # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
     def get_lr(it):
         # 1) linear warmup for warmup_iters steps
         if it < warmup_steps:
@@ -365,6 +377,7 @@ if __name__ == "__main__":
     # create the log directory we will write checkpoints to and log to
     timestamp = datetime.now().strftime("%Y-%m-%d_%H")
     log_dir = f"log/log_{timestamp}_B{B}_T{T}_lr{max_lr}"
+    log_dir = f"log/{wandb.run.name}_B{B}_T{T}_lr{max_lr}"
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"log.txt")
     with open(log_file, "w") as f: # open for writing to clear the file
@@ -393,6 +406,8 @@ if __name__ == "__main__":
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
             if master_process:
                 print(f"validation loss: {val_loss_accum.item():.4f}")
+                wandb.log({"validation_loss": val_loss_accum.item(), "step": step})
+
                 with open(log_file, "a") as f:
                     f.write(f"{step} val {val_loss_accum.item():.4f}\n")
                 if step > 0 and (step % 5000 == 0 or last_step):
@@ -407,6 +422,7 @@ if __name__ == "__main__":
                     # you might also want to add optimizer.state_dict() and
                     # rng seeds etc., if you wanted to more exactly resume training
                     torch.save(checkpoint, checkpoint_path)
+                    # wandb.save(checkpoint_path)
 
         # once in a while evaluate hellaswag
         if (step % 250 == 0 or last_step) and (not use_compile):
@@ -505,6 +521,11 @@ if __name__ == "__main__":
             print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | token/sec: {tokens_per_sec:.2f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} train {loss_accum.item():.6f}\n")
+            wandb.log({
+                "train_loss": loss_accum.item(),
+                "learning_rate": lr,
+                "step": step
+            })
 
     if ddp:
         destroy_process_group()
