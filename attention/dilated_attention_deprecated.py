@@ -43,7 +43,7 @@ def denseToSparse(dense_tensor, dilation_rate, head_index=0, offset=True):
             sparse_tensor[..., start + i * dilation_rate, start + j * dilation_rate] = dense_tensor[..., i, j]
     return sparse_tensor
 
-class MixedDilatedAttention(nn.Module):
+class MixedDilatedAttentionDeprecated(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0

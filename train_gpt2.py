@@ -12,14 +12,14 @@ from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
 from collections import OrderedDict
 from attention.causal_self_attention import CausalSelfAttention
-from attention.dilated_attention import MixedDilatedAttention
+from attention.dilated_attention import DilatedAttention
 from attention.differential_attention import DifferentialFlashAttention
 from attention.linear_attention import LinearAttention
 from attention.feedforward import MLPFFN, MixFFN
 
 torch.cuda.empty_cache()  # Clear the cache
 
-BLOCK_SIZE = 2048 # B*T = 16,384 tokens in one forward & backward
+BLOCK_SIZE = 1024 # B*T = 16,384 tokens in one forward & backward
 N_LAYER = 12
 N_HEAD = 12
 N_EMBD = 768
@@ -30,27 +30,29 @@ LEARNING_RATE = 3e-4        # Originally 6e-4, 3e-4 is adjusted for batch size 1
 MAX_STEPS = 19703           # ??
 WARMUP_STEPS = 1500         # Originally 715, 1500 is adjusted for batch size 16
 MODEL_NAME = 'gpt2'
+ATTN_NAME = 'longnet'
 DATASET_NAME = 'edu_fineweb10B'
 
 class Block(nn.Module):
     def __init__(self, config, depth):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
-        # self.attn = MixedDilatedAttention(
-        #     config, 
-        #     wr_pairs = [(64, 1),(128, 2),(256,4),(512,8),(1024,16)]
-        # )
+        # self.attn = CausalSelfAttention(config)
         # self.attn = DifferentialFlashAttention(config, depth)
         # self.attn = LinearAttention(config)
+        self.attn = DilatedAttention(config) # torchscale LongNet DilatedAttention
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLPFFN(config)
         # self.mlp = MixFFN(config)
     
     def forward(self, x, kv_cache=None, use_cache=False, output_attentions=False):
-        attn_output, attn_weights, updated_kv_cache = self.attn(
-            self.ln_1(x), kv_cache=kv_cache, use_cache=use_cache, output_attentions=output_attentions
-        )
+        attn_weights, updated_kv_cache = None, None
+        x = self.ln_1(x)
+        
+        # attn_output, attn_weights, updated_kv_cache = self.attn(
+        #     self.ln_1(x), kv_cache=kv_cache, use_cache=use_cache, output_attentions=output_attentions
+        # )
+        attn_output = self.attn(x) # torchscale LongNet DilatedAttention
         x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
 
@@ -278,16 +280,18 @@ if __name__ == "__main__":
     import torch.distributed as dist
     
     # Initialize wandb
-    wandb.init(project="gpt2-training", entity="eunjin-lee", config={
-        "model": MODEL_NAME,
-        "batch_size": BATCH_SIZE,
-        "total_batch_size": TOTAL_BATCH_SIZE,
-        "block_size": BLOCK_SIZE,
-        "learning_rate": LEARNING_RATE,
-        "max_steps": MAX_STEPS, # 19703
-        "warmup_steps": WARMUP_STEPS, # 1500
-    })
-    wandb.run.name = f'{MODEL_NAME}_{DATASET_NAME}_B{BATCH_SIZE}_T{BLOCK_SIZE}_lr{LEARNING_RATE}'
+    is_wandb = False
+    if is_wandb:
+        wandb.init(project="gpt2-training", entity="eunjin-lee", config={
+            "model": MODEL_NAME,
+            "batch_size": BATCH_SIZE,
+            "total_batch_size": TOTAL_BATCH_SIZE,
+            "block_size": BLOCK_SIZE,
+            "learning_rate": LEARNING_RATE,
+            "max_steps": MAX_STEPS, # 19703
+            "warmup_steps": WARMUP_STEPS, # 1500
+        })
+        wandb.run.name = f'{MODEL_NAME}_{ATTN_NAME}_{DATASET_NAME}_B{BATCH_SIZE}_T{BLOCK_SIZE}_lr{LEARNING_RATE}'
 
     # set up DDP (distributed data parallel).
     # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
@@ -377,7 +381,8 @@ if __name__ == "__main__":
     # create the log directory we will write checkpoints to and log to
     timestamp = datetime.now().strftime("%Y-%m-%d_%H")
     log_dir = f"log/log_{timestamp}_B{B}_T{T}_lr{max_lr}"
-    log_dir = f"log/{wandb.run.name}_B{B}_T{T}_lr{max_lr}"
+    if is_wandb:
+        log_dir = f"log/{wandb.run.name}_B{B}_T{T}_lr{max_lr}"
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"log.txt")
     with open(log_file, "w") as f: # open for writing to clear the file
@@ -406,7 +411,8 @@ if __name__ == "__main__":
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
             if master_process:
                 print(f"validation loss: {val_loss_accum.item():.4f}")
-                wandb.log({"validation_loss": val_loss_accum.item(), "step": step})
+                if is_wandb:
+                    wandb.log({"validation_loss": val_loss_accum.item(), "step": step})
 
                 with open(log_file, "a") as f:
                     f.write(f"{step} val {val_loss_accum.item():.4f}\n")
@@ -521,11 +527,12 @@ if __name__ == "__main__":
             print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | token/sec: {tokens_per_sec:.2f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} train {loss_accum.item():.6f}\n")
-            wandb.log({
-                "train_loss": loss_accum.item(),
-                "learning_rate": lr,
-                "step": step
-            })
+            if is_wandb:
+                wandb.log({
+                    "train_loss": loss_accum.item(),
+                    "learning_rate": lr,
+                    "step": step
+                })
 
     if ddp:
         destroy_process_group()
