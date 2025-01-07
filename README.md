@@ -14,7 +14,7 @@ python fineweb.py
 ### Train the GPT2 model
 To run the DDP (assuming you have 8 GPUs in your machine)
 ```
-torchrun --standalone --nproc_per_node=8 train_gpt2.py
+./run_train_gpt2.sh
 ```
 
 or if you have problem with torchrun command, run
