@@ -30,7 +30,7 @@ LEARNING_RATE = 3e-4        # Originally 6e-4, 3e-4 is adjusted for batch size 1
 MAX_STEPS = 19703           # ??
 WARMUP_STEPS = 1500         # Originally 715, 1500 is adjusted for batch size 16
 MODEL_NAME = 'gpt2'
-ATTN_NAME = 'longnet'
+ATTN_NAME = 'dilated'
 DATASET_NAME = 'edu_fineweb10B'
 
 class Block(nn.Module):

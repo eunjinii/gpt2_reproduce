@@ -21,11 +21,10 @@ class DilatedAttention(nn.Module):
         
         decoder_config = DecoderConfig(
             vocab_size=50304,
-            segment_length='[1024,2048]',
-            dilated_ratio='[1,2]',
+            segment_length='[512,1024,2048]',
+            dilated_ratio='[1,2,4]',
             flash_attention=True,
         )
-        # self.attn = LongNetDecoderLayer(decoder_config) # embed_tokens 까지 집어넣어줘야 함, 결국 
         self.attn = di_attn(
             args = decoder_config,
             embed_dim=config.n_embd,
