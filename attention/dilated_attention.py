@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torchscale.architecture.config import DecoderConfig
 from torchscale.component.dilated_attention import DilatedAttention as di_attn
+from einops import rearrange
 
 torch.cuda.empty_cache()  # Clear the cache
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -21,8 +22,8 @@ class DilatedAttention(nn.Module):
         
         decoder_config = DecoderConfig(
             vocab_size=50304,
-            segment_length='[512,1024,2048]',
-            dilated_ratio='[1,2,4]',
+            segment_length='[256,512,1024,2048,4096]',
+            dilated_ratio='[1,2,4,8,16]',
             flash_attention=True,
         )
         self.attn = di_attn(
@@ -35,21 +36,24 @@ class DilatedAttention(nn.Module):
             subln=False,
         )
 
-    def forward(self, x, kv_cache=None, use_cache=False, output_attentions=False):
-        B, T, C = x.size() # batch, seq_len, embedding dim
-        qkv = self.c_attn(x)
-        query, key, value = qkv.split(self.n_embd, dim=2)
-
+    def forward(
+        self,
+        x,
+        incremental_state = None, # Originally kv_cache, renamed for compatibility with torchscale
+        use_cache: bool = False, # Not used in Dilated Attention
+        output_attentions: bool = False, 
+        is_first_step: bool = False, # Added for compatibility with torchscale
+    ):
+        """
+           Wrapper for the Dilated Attention module 
+        """
         y, _ = self.attn(
-            query,
-            key,
-            value,
-            incremental_state=None,
-            key_padding_mask=None,
-            attn_mask=None,
-            rel_pos=None, # ?
-            is_first_step=False, # ?
+            query=x,
+            key=x,
+            value=x,
+            incremental_state=None, # Fixme
+            is_first_step=is_first_step,
             is_causal=True,
         )
         
-        return y 
+        return y, None

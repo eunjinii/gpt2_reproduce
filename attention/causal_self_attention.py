@@ -49,4 +49,4 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
 
         # Return outputs and attention weights if needed
-        return y, att_weights, updated_kv_cache
+        return y, updated_kv_cache, att_weights

@@ -19,16 +19,17 @@ from attention.feedforward import MLPFFN, MixFFN
 
 torch.cuda.empty_cache()  # Clear the cache
 
-BLOCK_SIZE = 1024 # B*T = 16,384 tokens in one forward & backward
+BLOCK_SIZE = 4096 # B*T = 16,384 tokens in one forward & backward
 N_LAYER = 12
 N_HEAD = 12
 N_EMBD = 768
 
-BATCH_SIZE = 16 # # original B = 32
-TOTAL_BATCH_SIZE = 524288
+BATCH_SIZE = 8 # # original B = 32. batch size 8 + grad_accum_steps * 2, instead of batch size 16
+TOTAL_BATCH_SIZE = 524288 // 2 # Original 524288
 LEARNING_RATE = 3e-4        # Originally 6e-4, 3e-4 is adjusted for batch size 16
-MAX_STEPS = 19703           # ??
-WARMUP_STEPS = 1500         # Originally 715, 1500 is adjusted for batch size 16
+MAX_STEPS = 19703 * 2       # Originally 19703
+WARMUP_STEPS = 1000         # Originally 715, 1500 is adjusted for batch size 16
+GRAD_ACCUM_STEPS = TOTAL_BATCH_SIZE // (BATCH_SIZE * BLOCK_SIZE * 8) * 2 # 8 = DDP world size. Originally single update in 32 grad accums
 MODEL_NAME = 'gpt2'
 ATTN_NAME = 'dilated'
 DATASET_NAME = 'edu_fineweb10B'
@@ -45,18 +46,30 @@ class Block(nn.Module):
         self.mlp = MLPFFN(config)
         # self.mlp = MixFFN(config)
     
-    def forward(self, x, kv_cache=None, use_cache=False, output_attentions=False):
-        attn_weights, updated_kv_cache = None, None
+    def forward(
+        self,
+        x,
+        incremental_state=None, # TODO: rename to kv_cache later
+        use_cache=False,
+        output_attentions=False,
+        is_first_step: bool = False, # for torchscale LongNet DilatedAttention
+    ):
+        attn_weights = None
         x = self.ln_1(x)
-        
-        # attn_output, attn_weights, updated_kv_cache = self.attn(
+        # attn_output, updated_kv_cache, attn_weights = self.attn(
         #     self.ln_1(x), kv_cache=kv_cache, use_cache=use_cache, output_attentions=output_attentions
         # )
-        attn_output = self.attn(x) # torchscale LongNet DilatedAttention
+        
+        # torchscale LongNet DilatedAttention
+        attn_output, attn_weights = self.attn(
+            x,
+            incremental_state=incremental_state, # TODO: rename to kv_cache later
+            is_first_step=is_first_step,
+        )
         x = x + attn_output
         x = x + self.mlp(self.ln_2(x))
 
-        return x, attn_weights, updated_kv_cache
+        return x, incremental_state
 
 @dataclass
 class GPTConfig:
@@ -96,7 +109,15 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, kv_cache=None, use_cache=False, output_attentions=False):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        past_key_values: list=None,
+        use_cache=False,
+        output_attentions=False,
+        is_first_step: bool = False, # for torchscale LongNet DilatedAttention
+    ):
         # idx is of shape (B, T), T is time dimension
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -106,11 +127,25 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
         x = tok_emb + pos_emb
 
+        # Initialize KV cache if needed
+        if past_key_values is None:
+            past_key_values = [{} for _ in self.transformer.h]  # Empty dict per layer
+        present_key_values = []
+        
         all_attentions = []  # Store attention weights from all layers
-        for block in self.transformer.h:
-            x, attn_weights, kv_cache = block(x, kv_cache=kv_cache, use_cache=use_cache, output_attentions=output_attentions)
+        for i, block in enumerate(self.transformer.h):
+            incremental_state = past_key_values[i]
+            x, layer_inc_state = block(
+                x,
+                # kv_cache=kv_cache.get(i, None),
+                incremental_state=incremental_state,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                is_first_step=is_first_step,
+            )
             if output_attentions and output['attn_weights'] is not None:
                 all_attentions.append(attn_weights)
+            present_key_values.append(layer_inc_state)
                 
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
@@ -121,7 +156,7 @@ class GPT(nn.Module):
         output = OrderedDict()
         output['logits'] = logits
         output['loss'] = loss
-        output['kv_cache'] = kv_cache  # Include the kv_cache in the output
+        output['present_key_values'] = present_key_values  # Include the kv_cache in the output
         if output_attentions:
             output['attentions'] = all_attentions
 
@@ -268,19 +303,19 @@ def get_most_likely_row(tokens, mask, logits):
     # the one with the lowest loss should be the most likely
     pred_norm = avg_loss.argmin().item()
     return pred_norm
+
 # -----------------------------------------------------------------------------
 
+# run the training loop
 if __name__ == "__main__":
-    # simple launch: $ python train_gpt2.py
-    # DDP launch for e.g. 8 GPUs: $ torchrun --standalone --nproc_per_node=8 train_gpt2.py
-
-    # run the training loop
     from torch.distributed import init_process_group, destroy_process_group
     from torch.nn.parallel import DistributedDataParallel as DDP
     import torch.distributed as dist
     
+    is_use_kv_cache = True
+    
     # Initialize wandb
-    is_wandb = False
+    is_wandb = True
     if is_wandb:
         wandb.init(project="gpt2-training", entity="eunjin-lee", config={
             "model": MODEL_NAME,
@@ -332,7 +367,7 @@ if __name__ == "__main__":
     B = BATCH_SIZE # original B = 32
     T = BLOCK_SIZE # B*T = 16,384 tokens in one forward & backward
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B*T*ddp_world_size" # each gpu calculates loss of B*T*ddp_world_size tokens in one step
-    grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # single update in 32 grad accums
+    grad_accum_steps = GRAD_ACCUM_STEPS
     if master_process:
         print(f"total desired batch size: {total_batch_size}")
         print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
@@ -345,6 +380,7 @@ if __name__ == "__main__":
     # create model
     model = GPT(GPTConfig(vocab_size=50304)) ## 5 override into a number that is powers of two
     model.to(device)
+    
     use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
     if use_compile:
         model = torch.compile(model)    
@@ -353,12 +389,9 @@ if __name__ == "__main__":
         model = DDP(model, find_unused_parameters=True, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
 
-    max_lr = LEARNING_RATE # batch size 16
-    # max_lr = 6e-4 # original
+    max_lr = LEARNING_RATE
     min_lr = max_lr * 0.1
     warmup_steps = WARMUP_STEPS
-    # warmup_steps = 715 # Original
-    # warmup_steps = 375 #FIXME: 375 for differential attention
     max_steps = MAX_STEPS # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
     def get_lr(it):
         # 1) linear warmup for warmup_iters steps
@@ -375,14 +408,12 @@ if __name__ == "__main__":
 
     # optimization steps
     optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device_type) # batch size 8
-    # optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type) # original
-    # optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=1.5e-4, device_type=device_type) #FIXME: 1.5e-4 for differential attention
 
     # create the log directory we will write checkpoints to and log to
     timestamp = datetime.now().strftime("%Y-%m-%d_%H")
     log_dir = f"log/log_{timestamp}_B{B}_T{T}_lr{max_lr}"
     if is_wandb:
-        log_dir = f"log/{wandb.run.name}_B{B}_T{T}_lr{max_lr}"
+        log_dir = f"log/{wandb.run.name}"
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"log.txt")
     with open(log_file, "w") as f: # open for writing to clear the file
@@ -462,6 +493,10 @@ if __name__ == "__main__":
                 print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
                 with open(log_file, "a") as f:
                     f.write(f"{step} hella {acc_norm:.4f}\n")
+                if is_wandb:
+                    wandb.log({
+                        "hellaswag acc": acc_norm,
+                    })
 
         # generate samples
         if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
@@ -500,8 +535,22 @@ if __name__ == "__main__":
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
+            
+            """
+            ================== GPT forward pass ==================
+            idx, targets: (B, T) tensors of input and target tokens
+            kv_cache: dict of tensors for caching key, value states, for inference
+            use_cache: bool, whether to use the cache
+            output_attentions: bool, whether to output attention weights
+            """
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16): ## 2
-                output = model(x, y)
+                output = model(
+                    x,
+                    y,
+                    use_cache=is_use_kv_cache,
+                    is_first_step=step
+                )
+
             loss = output['loss'] / grad_accum_steps ## 9. normalizing by grad_accum_steps
             loss_accum += loss.detach()
             if ddp:
@@ -514,7 +563,7 @@ if __name__ == "__main__":
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-        
+
         optimizer.step()
         if device_type == "cuda":
             torch.cuda.synchronize()
